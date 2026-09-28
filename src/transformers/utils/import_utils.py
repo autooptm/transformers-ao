@@ -44,7 +44,50 @@ from . import logging
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-PACKAGE_DISTRIBUTION_MAPPING = importlib.metadata.packages_distributions()
+class _Opt11(dict):
+
+    _scanned = False
+
+    def _scan(self):
+        if not self._scanned:
+            self._scanned = True
+            self.update(importlib.metadata.packages_distributions())
+
+    def __getitem__(self, key):
+        self._scan()
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        self._scan()
+        return dict.get(self, key, default)
+
+    def __contains__(self, key):
+        self._scan()
+        return dict.__contains__(self, key)
+
+    def __iter__(self):
+        self._scan()
+        return dict.__iter__(self)
+
+    def __len__(self):
+        self._scan()
+        return dict.__len__(self)
+
+    def keys(self):
+        self._scan()
+        return dict.keys(self)
+
+    def items(self):
+        self._scan()
+        return dict.items(self)
+
+    def values(self):
+        self._scan()
+        return dict.values(self)
+
+
+PACKAGE_DISTRIBUTION_MAPPING = _Opt11()
+_AO_OPT_12 = os.environ.get("AUTOOPTM_OPT_6", "1") == "1"
 
 
 def _candidate_distribution_names(pkg_name: str) -> list[str]:
@@ -72,7 +115,13 @@ def _is_package_available(pkg_name: str, return_version: bool = False) -> tuple[
     package_exists = spec is not None
     package_version = "N/A"
     if package_exists and return_version:
-        for distribution_name in _candidate_distribution_names(pkg_name):
+        direct = (pkg_name.replace("_", "-"), pkg_name) if _AO_OPT_12 else ()
+
+        def _ao_candidates():
+            yield from direct
+            yield from _candidate_distribution_names(pkg_name)
+
+        for distribution_name in _ao_candidates():
             try:
                 package_version = importlib.metadata.version(distribution_name)
                 break

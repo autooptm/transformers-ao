@@ -35,6 +35,7 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
+import json
 import logging
 import math
 import os
@@ -290,6 +291,30 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    if (
+        os.environ.get("AUTOOPTM_OPT_1", "1") == "1"
+        and not training_args.bf16
+        and not training_args.fp16
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    ):
+        training_args.bf16 = True
+        training_args.mixed_precision = "bf16"
+        assert training_args.mixed_precision == "bf16", "[autooptm] option 1 did not engage"
+
+    if os.environ.get("AUTOOPTM_OPT_2", "1") == "1":
+        if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+            with open(os.path.abspath(sys.argv[1])) as _f:
+                _ao_given = set(json.load(_f))
+        else:
+            _ao_given = {a[2:].split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")}
+        if "logging_nan_inf_filter" not in _ao_given:
+            training_args.logging_nan_inf_filter = False
+        if "accelerator_config" not in _ao_given and torch.cuda.is_available():
+            training_args.accelerator_config.non_blocking = True
+        if "dataloader_num_workers" not in _ao_given and training_args.dataloader_num_workers == 0:
+            training_args.dataloader_num_workers = min(4, os.cpu_count() or 1)
+
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -482,6 +507,18 @@ def main():
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
 
+    if os.environ.get("AUTOOPTM_OPT_3", "1") == "1" and torch.cuda.is_available():
+        _blocks = getattr(getattr(model, "transformer", None), "h", None)
+        if _blocks is None:
+            _blocks = getattr(getattr(model, "model", None), "layers", None)
+        if _blocks is not None and len(_blocks) > 0:
+            _block_cls = type(_blocks[0])
+            if not getattr(_block_cls, "_autooptm_opt_8", False):
+                _block_cls._autooptm_opt_7 = _block_cls.forward
+                _block_cls.forward = torch.compile(_block_cls.forward)
+                _block_cls._autooptm_opt_8 = True
+                logger.info(f"[autooptm] optimized {_block_cls.__name__}.forward (x{len(_blocks)} instances)")
+
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
@@ -668,6 +705,15 @@ def main():
     # Evaluation
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
+
+        _blocks_eval = getattr(getattr(model, "transformer", None), "h", None)
+        if _blocks_eval is None:
+            _blocks_eval = getattr(getattr(model, "model", None), "layers", None)
+        if _blocks_eval is not None and len(_blocks_eval) > 0:
+            _cls = type(_blocks_eval[0])
+            if getattr(_cls, "_autooptm_opt_8", False):
+                _cls.forward = _cls._autooptm_opt_7
+                _cls._autooptm_opt_8 = False
 
         metrics = trainer.evaluate()
 

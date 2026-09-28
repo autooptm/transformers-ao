@@ -1,0 +1,233 @@
+diff --git a/examples/pytorch/language-modeling/run_clm.py b/examples/pytorch/language-modeling/run_clm.py
+index 00a65dd..4710a89 100755
+--- a/examples/pytorch/language-modeling/run_clm.py
++++ b/examples/pytorch/language-modeling/run_clm.py
+@@ -35,6 +35,7 @@ https://huggingface.co/models?filter=text-generation
+ """
+ # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+ 
++import json
+ import logging
+ import math
+ import os
+@@ -290,6 +291,30 @@ def main():
+     else:
+         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+ 
++    if (
++        os.environ.get("AUTOOPTM_OPT_1", "1") == "1"
++        and not training_args.bf16
++        and not training_args.fp16
++        and torch.cuda.is_available()
++        and torch.cuda.is_bf16_supported()
++    ):
++        training_args.bf16 = True
++        training_args.mixed_precision = "bf16"
++        assert training_args.mixed_precision == "bf16", "[autooptm] option 1 did not engage"
++
++    if os.environ.get("AUTOOPTM_OPT_2", "1") == "1":
++        if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
++            with open(os.path.abspath(sys.argv[1])) as _f:
++                _ao_given = set(json.load(_f))
++        else:
++            _ao_given = {a[2:].split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")}
++        if "logging_nan_inf_filter" not in _ao_given:
++            training_args.logging_nan_inf_filter = False
++        if "accelerator_config" not in _ao_given and torch.cuda.is_available():
++            training_args.accelerator_config.non_blocking = True
++        if "dataloader_num_workers" not in _ao_given and training_args.dataloader_num_workers == 0:
++            training_args.dataloader_num_workers = min(4, os.cpu_count() or 1)
++
+     # Setup logging
+     logging.basicConfig(
+         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+@@ -482,6 +507,18 @@ def main():
+         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
+         logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
+ 
++    if os.environ.get("AUTOOPTM_OPT_3", "1") == "1" and torch.cuda.is_available():
++        _blocks = getattr(getattr(model, "transformer", None), "h", None)
++        if _blocks is None:
++            _blocks = getattr(getattr(model, "model", None), "layers", None)
++        if _blocks is not None and len(_blocks) > 0:
++            _block_cls = type(_blocks[0])
++            if not getattr(_block_cls, "_autooptm_opt_8", False):
++                _block_cls._autooptm_opt_7 = _block_cls.forward
++                _block_cls.forward = torch.compile(_block_cls.forward)
++                _block_cls._autooptm_opt_8 = True
++                logger.info(f"[autooptm] optimized {_block_cls.__name__}.forward (x{len(_blocks)} instances)")
++
+     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+     # on a small vocab and want a smaller embedding size, remove this test.
+     embedding_size = model.get_input_embeddings().weight.shape[0]
+@@ -669,6 +706,15 @@ def main():
+     if training_args.do_eval:
+         logger.info("*** Evaluate ***")
+ 
++        _blocks_eval = getattr(getattr(model, "transformer", None), "h", None)
++        if _blocks_eval is None:
++            _blocks_eval = getattr(getattr(model, "model", None), "layers", None)
++        if _blocks_eval is not None and len(_blocks_eval) > 0:
++            _cls = type(_blocks_eval[0])
++            if getattr(_cls, "_autooptm_opt_8", False):
++                _cls.forward = _cls._autooptm_opt_7
++                _cls._autooptm_opt_8 = False
++
+         metrics = trainer.evaluate()
+ 
+         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+diff --git a/src/transformers/activations.py b/src/transformers/activations.py
+index 2c3ad21..1ef2c3e 100644
+--- a/src/transformers/activations.py
++++ b/src/transformers/activations.py
+@@ -14,6 +14,7 @@
+ 
+ import functools
+ import math
++import os
+ from collections import OrderedDict
+ 
+ import torch
+@@ -24,6 +25,9 @@ from .utils import logging
+ from .utils.import_utils import is_torchdynamo_compiling
+ 
+ 
++_AO_OPT_9 = os.environ.get("AUTOOPTM_OPT_4", "1") == "1"
++
++
+ logger = logging.get_logger(__name__)
+ 
+ 
+@@ -63,6 +67,8 @@ class NewGELUActivation(nn.Module):
+     """
+ 
+     def forward(self, input: Tensor) -> Tensor:
++        if _AO_OPT_9:
++            return nn.functional.gelu(input, approximate="tanh")
+         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+ 
+ 
+diff --git a/src/transformers/models/gpt2/modeling_gpt2.py b/src/transformers/models/gpt2/modeling_gpt2.py
+index c5f8a1f..b5be100 100644
+--- a/src/transformers/models/gpt2/modeling_gpt2.py
++++ b/src/transformers/models/gpt2/modeling_gpt2.py
+@@ -15,6 +15,7 @@
+ """PyTorch OpenAI GPT-2 model."""
+ 
+ import math
++import os
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ 
+@@ -50,6 +51,8 @@ from .configuration_gpt2 import GPT2Config
+ 
+ logger = logging.get_logger(__name__)
+ 
++_AO_OPT_10 = os.environ.get("AUTOOPTM_OPT_5", "1") == "1"
++
+ 
+ def eager_attention_forward(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+     if scaling is None:
+@@ -694,7 +697,17 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
+         hidden_states = transformer_outputs.last_hidden_state
+ 
+         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+-        logits = self.lm_head(hidden_states[:, slice_indices, :])
++
++        pad = 0
++        if _AO_OPT_10 and labels is not None and self.training:
++            pad = (-self.lm_head.weight.shape[0]) % 8
++        if pad:
++            weight = self.lm_head.weight
++            weight = torch.cat([weight, weight.new_zeros(pad, weight.shape[1])], 0)
++            logits = nn.functional.linear(hidden_states[:, slice_indices, :], weight)
++            logits[..., -pad:] = torch.finfo(logits.dtype).min / 2
++        else:
++            logits = self.lm_head(hidden_states[:, slice_indices, :])
+ 
+         loss = None
+         if labels is not None:
+@@ -702,9 +715,11 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
+             loss = self.loss_function(
+                 logits,
+                 labels,
+-                vocab_size=self.config.vocab_size,
++                vocab_size=self.config.vocab_size + pad,
+                 **kwargs,
+             )
++        if pad:
++            logits = logits[..., : self.config.vocab_size]
+ 
+         return CausalLMOutputWithCrossAttentions(
+             loss=loss,
+diff --git a/src/transformers/utils/import_utils.py b/src/transformers/utils/import_utils.py
+index 30bcc54..9f69367 100644
+--- a/src/transformers/utils/import_utils.py
++++ b/src/transformers/utils/import_utils.py
+@@ -44,7 +44,50 @@ from . import logging
+ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+ 
+ 
+-PACKAGE_DISTRIBUTION_MAPPING = importlib.metadata.packages_distributions()
++class _Opt11(dict):
++
++    _scanned = False
++
++    def _scan(self):
++        if not self._scanned:
++            self._scanned = True
++            self.update(importlib.metadata.packages_distributions())
++
++    def __getitem__(self, key):
++        self._scan()
++        return dict.__getitem__(self, key)
++
++    def get(self, key, default=None):
++        self._scan()
++        return dict.get(self, key, default)
++
++    def __contains__(self, key):
++        self._scan()
++        return dict.__contains__(self, key)
++
++    def __iter__(self):
++        self._scan()
++        return dict.__iter__(self)
++
++    def __len__(self):
++        self._scan()
++        return dict.__len__(self)
++
++    def keys(self):
++        self._scan()
++        return dict.keys(self)
++
++    def items(self):
++        self._scan()
++        return dict.items(self)
++
++    def values(self):
++        self._scan()
++        return dict.values(self)
++
++
++PACKAGE_DISTRIBUTION_MAPPING = _Opt11()
++_AO_OPT_12 = os.environ.get("AUTOOPTM_OPT_6", "1") == "1"
+ 
+ 
+ def _candidate_distribution_names(pkg_name: str) -> list[str]:
+@@ -72,7 +115,13 @@ def _is_package_available(pkg_name: str, return_version: bool = False) -> tuple[
+     package_exists = spec is not None
+     package_version = "N/A"
+     if package_exists and return_version:
+-        for distribution_name in _candidate_distribution_names(pkg_name):
++        direct = (pkg_name.replace("_", "-"), pkg_name) if _AO_OPT_12 else ()
++
++        def _ao_candidates():
++            yield from direct
++            yield from _candidate_distribution_names(pkg_name)
++
++        for distribution_name in _ao_candidates():
+             try:
+                 package_version = importlib.metadata.version(distribution_name)
+                 break

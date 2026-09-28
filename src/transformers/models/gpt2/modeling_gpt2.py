@@ -15,6 +15,7 @@
 """PyTorch OpenAI GPT-2 model."""
 
 import math
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -49,6 +50,8 @@ from .configuration_gpt2 import GPT2Config
 
 
 logger = logging.get_logger(__name__)
+
+_AO_OPT_10 = os.environ.get("AUTOOPTM_OPT_5", "1") == "1"
 
 
 def eager_attention_forward(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
@@ -694,7 +697,17 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         hidden_states = transformer_outputs.last_hidden_state
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        pad = 0
+        if _AO_OPT_10 and labels is not None and self.training:
+            pad = (-self.lm_head.weight.shape[0]) % 8
+        if pad:
+            weight = self.lm_head.weight
+            weight = torch.cat([weight, weight.new_zeros(pad, weight.shape[1])], 0)
+            logits = nn.functional.linear(hidden_states[:, slice_indices, :], weight)
+            logits[..., -pad:] = torch.finfo(logits.dtype).min / 2
+        else:
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:
@@ -702,9 +715,11 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
             loss = self.loss_function(
                 logits,
                 labels,
-                vocab_size=self.config.vocab_size,
+                vocab_size=self.config.vocab_size + pad,
                 **kwargs,
             )
+        if pad:
+            logits = logits[..., : self.config.vocab_size]
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,

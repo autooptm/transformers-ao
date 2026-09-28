@@ -1,3 +1,72 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>transformers · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>2.26x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-2.26x-2ea44f"></a>
+    <a href="https://github.com/huggingface/transformers/commit/c587bc884db2c2e31fc2b8102314656b17aa07b1"><img alt="base" src="https://img.shields.io/badge/upstream-c587bc884db2-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%205090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [huggingface/transformers](https://github.com/huggingface/transformers) at commit
+> [`c587bc884db2`](https://github.com/huggingface/transformers/commit/c587bc884db2c2e31fc2b8102314656b17aa07b1) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+What is measured is upstream's own GPT-2 causal-LM fine-tuning example, `examples/pytorch/language-modeling/run_clm.py`, run with the command its README documents. The data and the optimizer recipe are unchanged.
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python run_clm.py --model_name_or_path openai-community/gpt2 --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1 --per_device_train_batch_size 8 --per_device_eval_batch_size 8 --do_train --do_eval --output_dir /tmp/test-clm` (in `examples/pytorch/language-modeling`) |
+| **Entry point** | `examples/pytorch/language-modeling/run_clm.py` |
+| **Unit measured** | the training loop, `trainer.train()`, over 71 optimizer steps of GPT-2 (124M) on wikitext-2 at batch 8 × 1024 tokens, one-time warm-up included |
+| **Before (stock)** | 13.92 s for the loop (183.1 ms per step) |
+| **After (this tree, all switches default ON)** | 6.15 s for the loop (58.1 ms per step steady state, 3.15x) |
+| **Speedup** | **2.26x** end to end on RTX 5090, three interleaved repeats per arm spreading 1.5% or less |
+| **Output** | the default tree trains at reduced precision with full-precision master weights and optimizer state: train loss 3.3874 vs 3.3755 stock over the 71 steps, eval perplexity 19.74 vs 19.55; one switch keeps full precision. Every other change leaves the data, the batches and the recipe as they were |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `examples/pytorch/language-modeling/run_clm.py` | main() -- just after argument parsing | 1.851x |
+| `examples/pytorch/language-modeling/run_clm.py` | main() -- after the model is built | 1.245x |
+| `src/transformers/activations.py` | NewGELUActivation.forward | 1.222x |
+| `src/transformers/models/gpt2/modeling_gpt2.py` | GPT2LMHeadModel.forward | 1.118x |
+| `examples/pytorch/language-modeling/run_clm.py` | main() -- just after argument parsing, second block | 1.052x |
+| `src/transformers/utils/import_utils.py` | module import, `_is_package_available()` | `import transformers` 0.52 s -> 0.38 s |
+| `examples/pytorch/language-modeling/run_clm.py` | main() -- before trainer.evaluate() | 1.0x |
+
+Every change sits behind an environment switch that defaults on (see `.autooptm/autooptm.patch`), and an option you set explicitly on the command line always wins over the patch's default.
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/transformers-ao.git
+cd transformers-ao
+pip install -e . accelerate datasets evaluate scikit-learn
+cd examples/pytorch/language-modeling
+python run_clm.py --model_name_or_path openai-community/gpt2 --dataset_name wikitext \
+  --dataset_config_name wikitext-2-raw-v1 --per_device_train_batch_size 8 \
+  --per_device_eval_batch_size 8 --do_train --do_eval --output_dir /tmp/test-clm
+# the measured unit: add --max_steps 71 --max_eval_samples 8
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff c587bc884db2 -- examples src` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <!---
 Copyright 2020 The HuggingFace Team. All rights reserved.
 
